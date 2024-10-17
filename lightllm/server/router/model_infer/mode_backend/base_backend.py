@@ -44,6 +44,7 @@ from lightllm.models.phi3.model import Phi3TpPartModel
 from lightllm.models.deepseek2.model import Deepseek2TpPartModel
 from lightllm.models.internvl.model import InternVLLlamaTpPartModel, InternVLPhi3TpPartModel
 from lightllm.models.internvl.model import InternVLInternlm2TpPartModel
+from lightllm.models.internvl_wquant.model import InternVLInternlm2TpPartModelWQuant
 from lightllm.models.qwen2_vl.model import Qwen2VLTpPartModel
 from lightllm.utils.infer_utils import set_random_seed
 from lightllm.utils.infer_utils import calculate_time, mark_start, mark_end
@@ -137,6 +138,8 @@ class ModeBackend:
                     self.model = Internlm2TpPartModelWQuant(model_kvargs)
                 elif self.model_type == "qwen2":
                     self.model = QWen2TpPartModelWQuant(model_kvargs)
+                elif self.model_type == "internvl":
+                    self.model = InternVLInternlm2TpPartModelWQuant(model_kvargs)
                 else:
                     raise Exception(f"weight_only_quant can not support {self.model_type}")
 
