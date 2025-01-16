@@ -121,9 +121,19 @@ def _fwd_kernel(
 
 @torch.no_grad()
 def context_attention_fwd(
-    q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, req_to_token_indexs
+    q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, req_to_token_indexs, config=None
 ):
-    BLOCK_M = 128 if not TESLA else 64
+    if config is None:
+        BLOCK_M = 128 if not TESLA else 64
+        BLOCK_N = BLOCK_M
+        num_warps = 4 if k.shape[-1] <= 64 else 8
+        num_stages = 1
+    else:
+        BLOCK_M = config["BLOCK_M"]
+        BLOCK_N = config["BLOCK_N"]
+        num_warps = config["num_warps"]
+        num_stages = config["num_stages"]
+        
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -136,10 +146,6 @@ def context_attention_fwd(
     kv_group_num = q.shape[1] // k.shape[1]
 
     grid = lambda meta: (triton.cdiv(max_input_len, meta["BLOCK_M"]), batch * head, 1)
-
-    BLOCK_N = BLOCK_M
-    num_warps = 4 if Lk <= 64 else 8
-    num_stages = 1
 
     _fwd_kernel[grid](
         q,
