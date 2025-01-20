@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 import math
 import torch.nn.functional as F
+from lightllm.common.autotuner import autotune
 
 TESLA = "Tesla" in torch.cuda.get_device_name(0)
 
@@ -119,6 +120,19 @@ def _fwd_kernel(
     tl.store(out_ptrs, acc, mask=offs_m[:, None] < cur_batch_seq_len)
 
 
+@autotune(
+    configs={
+        "BLOCK_M": [64, 128],
+        "BLOCK_N": [64, 128],
+        "num_warps": [4, 8],
+        "num_stages": [1],
+    },
+    key_func_dict={
+        "q": lambda q: f"n_ctx={triton.next_power_of_2(q.shape[0])}",
+        "q": lambda q: f"hidden_size={q.shape[-1]}",
+        "q": lambda q: f"dtype={q.dtype}",
+    },
+)
 @torch.no_grad()
 def context_attention_fwd(
     q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, req_to_token_indexs, config=None

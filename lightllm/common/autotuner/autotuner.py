@@ -2,55 +2,19 @@
 
 from typing import Dict
 from triton.runtime.jit import KernelInterface
+from triton.runtime.errors import OutOfResources
+from triton.testing import do_bench, do_bench_cudagraph
+from triton.compiler.errors import CompileTimeAssertionFailure
+import ujson as json
+import os 
+import torch
 import inspect
-import os
+from tqdm import tqdm
+from pathlib import Path
+import torch.distributed as dist
 
 
-class Autotuner(KernelInterface):
-
-    def __init__(
-        self,
-        fn,
-        configs,
-        key_func,
-        warmup=25,
-        rep=100,
-    ):
-        self.fn = fn
-        self.configs = configs
-        self.key_func = key_func
-        self.warmup = warmup
-        self.rep = rep
-
-        self.cache = {}
-
-    def search_best_config(self, *args, **kwargs):
-        pass
-
-    def run(self, *args, **kwargs):
-        key = self.key_func(*args, **kwargs)
-        if key not in self.cache:
-            best_config = self.search_best_config(key, *args, **kwargs)
-        else:
-            best_config = self.cache[key]
-        kwargs["config"] = best_config
-        return self.fn(*args, **kwargs)
-
-
-def generate_function_from_dict(fn, key_func_dict={}):
-    """
-    Dynamically creates a wrapper for the input function, applying specific transformations
-    to designated arguments based on key_func_dict.
-
-    Args:
-        fn (function): The original function to wrap.
-        key_func_dict (dict): A dictionary where keys are argument names from `fn`
-                              and values are transformation functions to apply to them.
-
-    Returns:
-        function: A new function that applies transformations and returns a comma-separated string
-                  of the transformed argument values.
-    """
+def _generate_function_from_dict(fn, key_func_dict={}):
     # Get the argument specification of the function
     spec = inspect.getfullargspec(fn)
     args = spec.args
@@ -89,8 +53,120 @@ def generate_function_from_dict(fn, key_func_dict={}):
     return generated_function
 
 
-def autotune(configs, key_func_dict={}, warmup=25, rep=100):
-    def decorator(fn):
-        return Autotuner(fn, configs, generate_function_from_dict(key_func_dict), warmup=warmup, rep=rep)
+def _get_cache_file_path(fn):
+    module_name = inspect.getmodule(fn).__name__ if inspect.getmodule(fn) else "<unknown_module>"
+    func_name = f"{module_name}.{fn.__name__}"
+    file_name = f"{func_name},{torch.cuda.get_device_name(0)}.json"
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = os.path.join(current_dir, "configs")
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    return os.path.join(cache_dir, file_name)
 
+
+class Autotuner():
+
+    def __init__(self, fn, configs, key_func_dict, enable_autotune, warmup, rep, top_k, init_warmup, init_rep, use_cuda_graph):
+        self.fn = fn
+        self.configs = configs
+        self.key_func = _generate_function_from_dict(fn, key_func_dict)
+        self.warmup = warmup
+        self.rep = rep
+        self.top_k = min(top_k, len(configs))
+        self.init_warmup = init_warmup
+        self.init_rep = init_rep
+        self.cache_file = _get_cache_file_path(fn)
+        self.cache = self._load_cache(self.cache_file)
+        self.enable_autotune = enable_autotune
+
+        if use_cuda_graph:
+            self.cuda_stream = torch.cuda.Stream()
+        self.use_cuda_graph = use_cuda_graph
+
+        self.know_rank_id = False
+
+    @staticmethod
+    def _load_cache(cache_file):
+        if os.path.exists(cache_file):
+            with open(cache_file, "r") as f:
+                return json.load(f)
+        return {}
+
+    def _save_cache(self):
+        with open(self.cache_file, "w") as f:
+            json.dump(self.cache, f, indent=4)
+        
+    def _bench(self, warmup, rep ,config, *args, **kwargs):
+        kwargs["config"] = config
+        def kernel_call():
+            try:
+                self.fn(*args,**kwargs)
+            except Exception as e:
+                raise
+        try:
+            if self.use_cuda_graph:
+                with torch.cuda.stream(self.cuda_stream):
+                    bench_res = do_bench_cudagraph(kernel_call, rep=rep, return_mode="median")
+                return bench_res
+            return do_bench(kernel_call, warmup=warmup, rep=rep, quantiles=(0.5,))[0]
+        except (OutOfResources, CompileTimeAssertionFailure):
+            return float("inf")
+
+    def search_best_config(self, key, *args, **kwargs):
+        # TODO: Optimize the implementation
+        initial_results = []
+        for config in tqdm(self.configs, desc="Initial screening"):
+            bench_time = self._bench(self.init_warmup, self.init_rep, config, *args, **kwargs)
+            initial_results.append((config, bench_time))
+        
+        initial_results.sort(key=lambda x: x[1])
+        top_k_configs = [config for config, _ in initial_results[:self.top_k]]
+        
+        final_results = []
+        for config in tqdm(top_k_configs, desc="Fine-grained screening"):
+            bench_time = self._bench(self.warmup, self.rep, config, *args, **kwargs)
+            final_results.append((config, bench_time))
+        
+        final_results.sort(key=lambda x: x[1])
+        self.cache[key] = final_results[0][0]
+        self._save_cache()
+
+    def run(self, *args, **kwargs):
+        # Only enable autotune in rank 0.
+        if not self.know_rank_id:
+            self.know_rank_id = True
+            assert dist.is_initialized(), "Distributed environment is not initialized"
+            rank_id = dist.get_rank()
+            if rank_id != 0:
+                self.enable_autotune = False
+
+        key = self.key_func(*args, **kwargs)
+        if key not in self.cache:
+            if self.enable_autotune:
+                self.search_best_config(key, *args, **kwargs)
+            else:
+                self.cache[key] = None
+        kwargs["config"] = self.cache[key]
+        return self.fn(*args, **kwargs)
+    
+    def __call__(self, *args, **kwargs):
+        return self.run(*args, **kwargs)
+
+
+def autotune(configs, key_func_dict={}, warmup=25, rep=100, init_warmup=2, init_rep=3, top_k=10, use_cuda_graph=True):
+    # 0: 关闭 autotune，1: 使用 autotune 配置，2: 启用 autotune 
+    autotune_level = os.getenv("AUTOTUNE_LEVEL", "1")
+    assert autotune_level in ["0", "1", "2"], "Invalid value for environment variable AUTOTUNE_LEVEL"
+
+    def decorator(fn):
+        if autotune_level == "0":
+            def wrapper(*args, **kwargs):
+                kwargs["config"] = None  # 保持配置为 None
+                return fn(*args, **kwargs)
+            return wrapper
+        
+        enable_autotune = autotune_level == "2"
+
+        # 正常返回 Autotuner 实例
+        return Autotuner(fn, configs, key_func_dict, enable_autotune, warmup=warmup, rep=rep, init_warmup=init_warmup, init_rep=init_rep, 
+                         top_k=top_k, use_cuda_graph=use_cuda_graph)
     return decorator
