@@ -57,7 +57,7 @@ def foo(a, b, c, d=1, e=2):
 
 # 生成新函数
 new_fn = generate_function_from_dict(foo, {
-    'b': lambda x: f"len={x.shape[0]}",
+    'b': lambda x: f"len1={x.shape[0]},len2={x.shape[1]}",
     "c": lambda x: f"lk={x.shape[-1]}",
     "d": lambda x: f"d={x}",
     'e': lambda x: f"e={x}"

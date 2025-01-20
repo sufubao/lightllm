@@ -121,17 +121,19 @@ def _fwd_kernel(
 
 
 @autotune(
-    configs={
+    kernel_name="llama.context_attention_fwd",
+    config_dict = {
         "BLOCK_M": [64, 128],
         "BLOCK_N": [64, 128],
         "num_warps": [4, 8],
-        "num_stages": [1],
+        "num_stages": [1, 2],
     },
-    key_func_dict={
-        "q": lambda q: f"n_ctx={triton.next_power_of_2(q.shape[0])}",
-        "q": lambda q: f"hidden_size={q.shape[-1]}",
-        "q": lambda q: f"dtype={q.dtype}",
+    static_key_dict={
+        "q": lambda q: f"hidden_size={q.shape[-1]},dtype={q.dtype}",
     },
+    dynamic_key_dict={
+        "max_input_len": lambda max_input_len: f"n_ctx={triton.next_power_of_2(max_input_len)}",
+    }
 )
 @torch.no_grad()
 def context_attention_fwd(
